@@ -1,0 +1,690 @@
+From d6a6b4fcb57916be294d693f1f59e3c33293dcc3 Mon Sep 17 00:00:00 2001
+From: Alesaiko <solcmdr@gmail.com>
+Date: Sun, 2 Feb 2020 20:10:24 +0300
+Subject: [PATCH 1/3] drm/msm/sde: Introduce KCAL color control
+
+Use PCC and HSIC interfaces to manually calibrate the colors of the
+DSI panel via sysfs.  This is a simple driver which uses predefined
+API to do this. As it is a purely platform driver, sysfs is located
+at /sys/devices/platform/kcal_ctrl.0
+
+Supported PCC and HSIC features:
+- RGB control,
+- Color distortion control,
+- Saturation intensity control,
+- Contrast intensity control,
+- Color brightness control,
+- Grayscale mode,
+- Astronomy mode;
+
+We already have atomic ops to alter DSI colors, but users prefer
+this interface over that.
+
+Change-Id: I4c6f2dd2db5ecba858049790a0a649a28ca68f9c
+Signed-off-by: Alesaiko <solcmdr@gmail.com>
+Signed-off-by: Panchajanya Sarkar <panchajanya@azure-dev.live>
+Signed-off-by: Panchajanya1999 <panchajanya@azure-dev.live>
+(cherry picked from commit 17b1d2564bebb298476c1974a71f989dc7ad9e6a)
+---
+ drivers/gpu/drm/msm/Kconfig                   |   9 +
+ drivers/gpu/drm/msm/Makefile                  |   2 +
+ drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c    | 201 ++++++++++++++++++
+ drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h    |  81 +++++++
+ .../msm/sde/sde_hw_reg_dma_v1_color_proc.c    | 125 +++++++++++
+ 5 files changed, 418 insertions(+)
+ create mode 100644 drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c
+ create mode 100644 drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h
+
+diff --git a/drivers/gpu/drm/msm/Kconfig b/drivers/gpu/drm/msm/Kconfig
+index bf5cbf48a868..b055d1a982ae 100644
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -179,6 +179,15 @@ config DRM_MSM_DSI_14NM_PHY
+ 	help
+ 	  Choose this option if DSI PHY on 8996 is used on the platform.
+ 
++config DRM_MSM_KCAL_CTRL
++	bool "Enable kernel-level color calibration control"
++	depends on DRM_MSM
++	default y
++	help
++	  Choose this option for kernel-level color calibration control.
++	  This will adjust every atomic operation pcc and hsic call
++	  configuration with the values from kernel.
++
+ config DRM_SDE_EVTLOG_DEBUG
+ 	bool "Enable event logging in MSM DRM"
+ 	depends on DRM_MSM
+diff --git a/drivers/gpu/drm/msm/Makefile b/drivers/gpu/drm/msm/Makefile
+index 93ee568c3a6e..1939dcdb89a1 100644
+--- a/drivers/gpu/drm/msm/Makefile
++++ b/drivers/gpu/drm/msm/Makefile
+@@ -58,6 +58,8 @@ msm_drm-y := \
+ msm_drm-$(CONFIG_DEBUG_FS) += sde_dbg.o \
+ 	sde_dbg_evtlog.o \
+ 
++msm_drm-$(CONFIG_DRM_MSM_KCAL_CTRL) += sde/sde_hw_kcal_ctrl.o
++
+ msm_drm-$(CONFIG_DRM_MSM_HDMI) += hdmi/hdmi.o \
+ 	hdmi/hdmi_audio.o \
+ 	hdmi/hdmi_bridge.o \
+diff --git a/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c
+new file mode 100644
+index 000000000000..9382f04a667c
+--- /dev/null
++++ b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c
+@@ -0,0 +1,201 @@
++/*
++ * Copyright (C) 2020, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
++
++#define KCAL_CTRL	"kcal_ctrl"
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <uapi/drm/msm_drm_pp.h>
++#include "sde_hw_kcal_ctrl.h"
++
++static struct sde_hw_kcal kcal_lut_data = {
++	.enabled		= SDE_HW_KCAL_ENABLED,
++	.min_value		= SDE_HW_KCAL_MIN_VALUE,
++
++	.pcc = (typeof(kcal_lut_data.pcc)) {
++		.red		= SDE_HW_KCAL_INIT_RED,
++		.green		= SDE_HW_KCAL_INIT_GREEN,
++		.blue		= SDE_HW_KCAL_INIT_BLUE,
++	},
++
++	.hsic = (typeof(kcal_lut_data.hsic)) {
++		.hue		= SDE_HW_KCAL_INIT_HUE,
++		.saturation	= SDE_HW_KCAL_INIT_ADJ,
++		.value		= SDE_HW_KCAL_INIT_ADJ,
++		.contrast	= SDE_HW_KCAL_INIT_ADJ,
++	},
++};
++
++struct sde_hw_kcal *sde_hw_kcal_get(void)
++{
++	return &kcal_lut_data;
++}
++
++struct drm_msm_pa_hsic sde_hw_kcal_hsic_struct(void)
++{
++	return (struct drm_msm_pa_hsic) {
++		.flags = PA_HSIC_HUE_ENABLE |
++			 PA_HSIC_SAT_ENABLE |
++			 PA_HSIC_VAL_ENABLE |
++			 PA_HSIC_CONT_ENABLE,
++		.hue		= kcal_lut_data.hsic.hue,
++		.saturation	= kcal_lut_data.hsic.saturation,
++		.value		= kcal_lut_data.hsic.value,
++		.contrast	= kcal_lut_data.hsic.contrast,
++	};
++}
++
++void sde_hw_kcal_pcc_adjust(u32 *data, int plane)
++{
++	struct sde_hw_kcal_pcc *pcc = &kcal_lut_data.pcc;
++	u32 palette[3] = { pcc->red, pcc->green, pcc->blue };
++	int idx = plane + 3 * (plane + 1);
++
++	data[idx] *= palette[plane];
++	data[idx] /= 256;
++}
++
++#define create_one_rw_node(node)					\
++static DEVICE_ATTR(node, 0644, show_##node, store_##node)
++
++#define define_one_kcal_node(node, object, min, max)			\
++static ssize_t show_##node(struct device *dev,				\
++			   struct device_attribute *attr,		\
++			   char *buf)					\
++{									\
++	return scnprintf(buf, 6, "%u\n", kcal_lut_data.object);	\
++}									\
++									\
++static ssize_t store_##node(struct device *dev,			\
++			    struct device_attribute *attr,		\
++			    const char *buf, size_t count)		\
++{									\
++	u32 val;							\
++	int ret;							\
++									\
++	ret = kstrtouint(buf, 10, &val);				\
++	if (ret || val < min || val > max)				\
++		return -EINVAL;					\
++									\
++	kcal_lut_data.object = val;					\
++									\
++	return count;							\
++}									\
++									\
++create_one_rw_node(node)
++
++static ssize_t show_kcal(struct device *dev,
++			 struct device_attribute *attr,
++			 char *buf)
++{
++	struct sde_hw_kcal_pcc *pcc = &kcal_lut_data.pcc;
++
++	return scnprintf(buf, 13, "%u %u %u\n",
++			 pcc->red, pcc->green, pcc->blue);
++}
++
++static ssize_t store_kcal(struct device *dev,
++			  struct device_attribute *attr,
++			  const char *buf, size_t count)
++{
++	struct sde_hw_kcal_pcc *pcc = &kcal_lut_data.pcc;
++	u32 kcal_r, kcal_g, kcal_b;
++	int ret;
++
++	ret = sscanf(buf, "%u %u %u", &kcal_r, &kcal_g, &kcal_b);
++	if (ret != 3 ||
++	    kcal_r < 1 || kcal_r > 256 ||
++	    kcal_g < 1 || kcal_g > 256 ||
++	    kcal_b < 1 || kcal_b > 256)
++		return -EINVAL;
++
++	pcc->red   = max(kcal_r, kcal_lut_data.min_value);
++	pcc->green = max(kcal_g, kcal_lut_data.min_value);
++	pcc->blue  = max(kcal_b, kcal_lut_data.min_value);
++
++	return count;
++}
++
++create_one_rw_node(kcal);
++define_one_kcal_node(kcal_enable, enabled, 0, 1);
++define_one_kcal_node(kcal_min, min_value, 1, 256);
++define_one_kcal_node(kcal_hue, hsic.hue, 0, 1536);
++define_one_kcal_node(kcal_sat, hsic.saturation, 128, 383);
++define_one_kcal_node(kcal_val, hsic.value, 128, 383);
++define_one_kcal_node(kcal_cont, hsic.contrast, 128, 383);
++
++static int sde_hw_kcal_ctrl_probe(struct platform_device *pdev)
++{
++	int ret;
++
++	ret  = device_create_file(&pdev->dev, &dev_attr_kcal);
++	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_enable);
++	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_min);
++	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_hue);
++	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_sat);
++	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_val);
++	ret |= device_create_file(&pdev->dev, &dev_attr_kcal_cont);
++	if (ret)
++		pr_err("Unable to create sysfs nodes\n");
++
++	return ret;
++}
++
++static int sde_hw_kcal_ctrl_remove(struct platform_device *pdev)
++{
++	device_remove_file(&pdev->dev, &dev_attr_kcal_cont);
++	device_remove_file(&pdev->dev, &dev_attr_kcal_val);
++	device_remove_file(&pdev->dev, &dev_attr_kcal_sat);
++	device_remove_file(&pdev->dev, &dev_attr_kcal_hue);
++	device_remove_file(&pdev->dev, &dev_attr_kcal_min);
++	device_remove_file(&pdev->dev, &dev_attr_kcal_enable);
++	device_remove_file(&pdev->dev, &dev_attr_kcal);
++
++	return 0;
++}
++
++static struct platform_driver sde_hw_kcal_ctrl_driver = {
++	.probe = sde_hw_kcal_ctrl_probe,
++	.remove = sde_hw_kcal_ctrl_remove,
++	.driver = {
++		.name = KCAL_CTRL,
++		.owner = THIS_MODULE,
++	},
++};
++
++static struct platform_device sde_hw_kcal_ctrl_device = {
++	.name = KCAL_CTRL,
++};
++
++static int __init sde_hw_kcal_ctrl_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&sde_hw_kcal_ctrl_driver);
++	if (ret) {
++		pr_err("Unable to register platform driver\n");
++		return ret;
++	}
++
++	ret = platform_device_register(&sde_hw_kcal_ctrl_device);
++	if (ret) {
++		pr_err("Unable to register platform device\n");
++		platform_driver_unregister(&sde_hw_kcal_ctrl_driver);
++		return ret;
++	}
++
++	return 0;
++}
++late_initcall(sde_hw_kcal_ctrl_init);
+diff --git a/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h
+new file mode 100644
+index 000000000000..4bc8d6ded6c4
+--- /dev/null
++++ b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2020, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#define SDE_HW_KCAL_ENABLED		(1)
++
++#define SDE_HW_KCAL_MIN_VALUE		(20)
++#define SDE_HW_KCAL_INIT_RED		(256)
++#define SDE_HW_KCAL_INIT_GREEN		(256)
++#define SDE_HW_KCAL_INIT_BLUE		(256)
++
++#define SDE_HW_KCAL_INIT_HUE		(0)
++#define SDE_HW_KCAL_INIT_ADJ		(255)
++
++struct sde_hw_kcal_pcc {
++	u32 red;
++	u32 green;
++	u32 blue;
++};
++
++struct sde_hw_kcal_hsic {
++	u32 hue;
++	u32 saturation;
++	u32 value;
++	u32 contrast;
++};
++
++struct sde_hw_kcal {
++	struct sde_hw_kcal_pcc pcc;
++	struct sde_hw_kcal_hsic hsic;
++
++	u32 enabled:1;
++	u32 min_value;
++};
++
++#ifdef CONFIG_DRM_MSM_KCAL_CTRL
++/**
++ * sde_hw_kcal_get() - get a handle to internal kcal calibration plan.
++ *
++ * Pointer is used here for performance reasons. Races are expected in
++ * color processing code.
++ */
++struct sde_hw_kcal *sde_hw_kcal_get(void);
++
++/**
++ * sde_hw_kcal_hsic_struct() - get hsic configuration structure with
++ * applied adjustments from kcal.
++ */
++struct drm_msm_pa_hsic sde_hw_kcal_hsic_struct(void);
++
++/**
++ * sde_hw_kcal_pcc_adjust() - change rgb colors according to kcal setup.
++ * @data: data array of pcc coefficients.
++ * @plane: index of pcc color plane.
++ */
++void sde_hw_kcal_pcc_adjust(u32 *data, int plane);
++#else
++static inline struct sde_hw_kcal sde_hw_kcal_get(void)
++{
++	return (struct sde_hw_kcal) { .enabled = false };
++}
++
++static inline struct drm_msm_pa_hsic sde_hw_kcal_hsic_struct(void)
++{
++	return (struct drm_msm_pa_hsic) { .flags = 0 };
++}
++
++static inline void sde_hw_kcal_pcc_adjust(u32 *data, int plane)
++{
++
++}
++#endif
+diff --git a/drivers/gpu/drm/msm/sde/sde_hw_reg_dma_v1_color_proc.c b/drivers/gpu/drm/msm/sde/sde_hw_reg_dma_v1_color_proc.c
+index b0d94597f918..b9c41f901750 100644
+--- a/drivers/gpu/drm/msm/sde/sde_hw_reg_dma_v1_color_proc.c
++++ b/drivers/gpu/drm/msm/sde/sde_hw_reg_dma_v1_color_proc.c
+@@ -13,6 +13,7 @@
+ #include "sde_reg_dma.h"
+ #include "sde_hw_reg_dma_v1_color_proc.h"
+ #include "sde_hw_color_proc_common_v4.h"
++#include "sde_hw_kcal_ctrl.h"
+ #include "sde_hw_ctl.h"
+ #include "sde_hw_sspp.h"
+ #include "sde_hwio.h"
+@@ -929,11 +930,125 @@ static void _dspp_pccv4_off(struct sde_hw_dspp *ctx, void *cfg)
+ 		DRM_ERROR("failed to kick off ret %d\n", rc);
+ }
+ 
++static int
++reg_dmav1_setup_dspp_pa_hsicv17_apply(struct sde_hw_dspp *ctx,
++				      struct drm_msm_pa_hsic *hsic_cfg,
++				      void *ctl)
++{
++	struct sde_hw_reg_dma_ops *dma_ops;
++	struct sde_reg_dma_kickoff_cfg kick_off;
++	struct sde_reg_dma_setup_ops_cfg dma_write_cfg;
++	u32 reg, local_opcode = 0;
++	int rc;
++
++	dma_ops = sde_reg_dma_get_ops();
++	dma_ops->reset_reg_dma_buf(dspp_buf[HSIC][ctx->idx]);
++
++	REG_DMA_INIT_OPS(dma_write_cfg, dspp_mapping[ctx->idx],
++		HSIC, dspp_buf[HSIC][ctx->idx]);
++
++	REG_DMA_SETUP_OPS(dma_write_cfg, 0, NULL, 0, HW_BLK_SELECT, 0, 0, 0);
++	rc = dma_ops->setup_payload(&dma_write_cfg);
++	if (rc) {
++		DRM_ERROR("write decode select failed ret %d\n", rc);
++		return rc;
++	}
++
++	if (hsic_cfg->flags & PA_HSIC_HUE_ENABLE) {
++		reg = hsic_cfg->hue & PA_HUE_MASK;
++		REG_DMA_SETUP_OPS(dma_write_cfg,
++			ctx->cap->sblk->hsic.base + PA_HUE_OFF,
++			&reg, sizeof(reg), REG_SINGLE_WRITE, 0, 0, 0);
++		rc = dma_ops->setup_payload(&dma_write_cfg);
++		if (rc) {
++			DRM_ERROR("hsic hue write failed ret %d\n", rc);
++			return rc;
++		}
++		local_opcode |= PA_HUE_EN;
++	}
++
++	if (hsic_cfg->flags & PA_HSIC_SAT_ENABLE) {
++		reg = hsic_cfg->saturation & PA_SAT_MASK;
++		REG_DMA_SETUP_OPS(dma_write_cfg,
++			ctx->cap->sblk->hsic.base + PA_SAT_OFF,
++			&reg, sizeof(reg), REG_SINGLE_WRITE, 0, 0, 0);
++		rc = dma_ops->setup_payload(&dma_write_cfg);
++		if (rc) {
++			DRM_ERROR("hsic saturation write failed ret %d\n", rc);
++			return rc;
++		}
++		local_opcode |= PA_SAT_EN;
++	}
++
++	if (hsic_cfg->flags & PA_HSIC_VAL_ENABLE) {
++		reg = hsic_cfg->value & PA_VAL_MASK;
++		REG_DMA_SETUP_OPS(dma_write_cfg,
++			ctx->cap->sblk->hsic.base + PA_VAL_OFF,
++			&reg, sizeof(reg), REG_SINGLE_WRITE, 0, 0, 0);
++		rc = dma_ops->setup_payload(&dma_write_cfg);
++		if (rc) {
++			DRM_ERROR("hsic value write failed ret %d\n", rc);
++			return rc;
++		}
++		local_opcode |= PA_VAL_EN;
++	}
++
++	if (hsic_cfg->flags & PA_HSIC_CONT_ENABLE) {
++		reg = hsic_cfg->contrast & PA_CONT_MASK;
++		REG_DMA_SETUP_OPS(dma_write_cfg,
++			ctx->cap->sblk->hsic.base + PA_CONT_OFF,
++			&reg, sizeof(reg), REG_SINGLE_WRITE, 0, 0, 0);
++		rc = dma_ops->setup_payload(&dma_write_cfg);
++		if (rc) {
++			DRM_ERROR("hsic contrast write failed ret %d\n", rc);
++			return rc;
++		}
++		local_opcode |= PA_CONT_EN;
++	}
++
++	if (local_opcode) {
++		local_opcode |= PA_EN;
++	} else {
++		DRM_ERROR("Invalid hsic config 0x%x\n", local_opcode);
++		return -EINVAL;
++	}
++
++	REG_DMA_SETUP_OPS(dma_write_cfg,
++		ctx->cap->sblk->hsic.base, &local_opcode, sizeof(local_opcode),
++		REG_SINGLE_MODIFY, 0, 0, REG_DMA_PA_MODE_HSIC_MASK);
++	rc = dma_ops->setup_payload(&dma_write_cfg);
++	if (rc) {
++		DRM_ERROR("setting opcode failed ret %d\n", rc);
++		return rc;
++	}
++
++	REG_DMA_SETUP_KICKOFF(kick_off, ctl, dspp_buf[HSIC][ctx->idx],
++			REG_DMA_WRITE, DMA_CTL_QUEUE0, WRITE_IMMEDIATE);
++	rc = dma_ops->kick_off(&kick_off);
++	if (rc)
++		DRM_ERROR("failed to kick off ret %d\n", rc);
++
++	return rc;
++}
++
++
++static inline void
++reg_dmav1_setup_dspp_pa_hsicv17_kcal(struct sde_hw_dspp *ctx, void *ctl)
++{
++	struct drm_msm_pa_hsic hsic_cfg = sde_hw_kcal_hsic_struct();
++	int rc;
++
++	rc = reg_dmav1_setup_dspp_pa_hsicv17_apply(ctx, &hsic_cfg, ctl);
++	if (rc)
++		pr_err("kernel hsic application failed ret %d\n", rc);
++}
++
+ void reg_dmav1_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
+ {
+ 	struct sde_hw_reg_dma_ops *dma_ops;
+ 	struct sde_reg_dma_kickoff_cfg kick_off;
+ 	struct sde_hw_cp_cfg *hw_cfg = cfg;
++	struct sde_hw_kcal *kcal = sde_hw_kcal_get();
+ 	struct sde_reg_dma_setup_ops_cfg dma_write_cfg;
+ 	struct drm_msm_pcc *pcc_cfg;
+ 	struct drm_msm_pcc_coeff *coeffs = NULL;
+@@ -1005,6 +1120,10 @@ void reg_dmav1_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
+ 		data[i + 3] = coeffs->r;
+ 		data[i + 6] = coeffs->g;
+ 		data[i + 9] = coeffs->b;
++
++		if (kcal->enabled)
++			sde_hw_kcal_pcc_adjust(data, i);
++
+ 		data[i + 12] = coeffs->rg;
+ 		data[i + 15] = coeffs->rb;
+ 		data[i + 18] = coeffs->gb;
+@@ -1037,6 +1156,8 @@ void reg_dmav1_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
+ 	if (rc)
+ 		DRM_ERROR("failed to kick off ret %d\n", rc);
+ 
++	if (kcal->enabled)
++		reg_dmav1_setup_dspp_pa_hsicv17_kcal(ctx, hw_cfg->ctl);
+ exit:
+ 	kfree(data);
+ }
+@@ -1048,9 +1169,13 @@ void reg_dmav1_setup_dspp_pa_hsicv17(struct sde_hw_dspp *ctx, void *cfg)
+ 	struct sde_hw_cp_cfg *hw_cfg = cfg;
+ 	struct sde_reg_dma_setup_ops_cfg dma_write_cfg;
+ 	struct drm_msm_pa_hsic *hsic_cfg;
++    struct sde_hw_kcal *kcal = sde_hw_kcal_get();
+ 	u32 reg = 0, opcode = 0, local_opcode = 0;
+ 	int rc;
+ 
++	if (kcal->enabled)
++		return;
++
+ 	opcode = SDE_REG_READ(&ctx->hw, ctx->cap->sblk->hsic.base);
+ 
+ 	rc = reg_dma_dspp_check(ctx, cfg, HSIC);
+-- 
+2.25.1
+
+
+From 2c97edc13e124678f115ba9b25ed07650307aa37 Mon Sep 17 00:00:00 2001
+From: tbalden <illespal@gmail.com>
+Date: Sat, 8 Sep 2018 17:20:46 -0700
+Subject: [PATCH 2/3] kcal: color control: upon config change force
+ reprocessing
+
+Even when supposedly the rendering is not dirty, force reprocess
+of filters.
+
+[YaAlex3: Adapt to aleksaiko's kcal implementation]
+
+Signed-off-by: Yaroslav Furman <yaro330@gmail.com>
+Signed-off-by: Panchajanya1999 <panchajanya@azure-dev.live>
+---
+ .../gpu/drm/msm/sde/sde_color_processing.c    | 29 +++++++++++++++++++
+ drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c    |  4 +++
+ drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h    |  6 ++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/sde/sde_color_processing.c b/drivers/gpu/drm/msm/sde/sde_color_processing.c
+index 7782dffc7e33..e7c3eb90abdb 100644
+--- a/drivers/gpu/drm/msm/sde/sde_color_processing.c
++++ b/drivers/gpu/drm/msm/sde/sde_color_processing.c
+@@ -26,6 +26,10 @@
+ #include "sde_core_irq.h"
+ #include "dsi_panel.h"
+ 
++#ifdef CONFIG_DRM_MSM_KCAL_CTRL
++#include "sde_hw_kcal_ctrl.h"
++#endif
++
+ struct sde_cp_node {
+ 	u32 property_id;
+ 	u32 prop_flags;
+@@ -1025,6 +1029,12 @@ void sde_cp_crtc_install_properties(struct drm_crtc *crtc)
+ 
+ }
+ 
++#ifdef CONFIG_DRM_MSM_KCAL_CTRL
++static struct drm_crtc *g_pcc_crtc;
++static struct drm_property *g_pcc_property;
++static uint64_t g_pcc_val;
++#endif
++
+ int sde_cp_crtc_set_property(struct drm_crtc *crtc,
+ 				struct drm_property *property,
+ 				uint64_t val)
+@@ -1058,6 +1068,15 @@ int sde_cp_crtc_set_property(struct drm_crtc *crtc,
+ 		goto exit;
+ 	}
+ 
++#ifdef CONFIG_DRM_MSM_KCAL_CTRL
++	if (prop_node->feature == SDE_CP_CRTC_DSPP_PCC) {
++		pr_info("%s pcc kad kcal\n",__func__);
++		g_pcc_crtc = crtc;
++		g_pcc_property = property;
++		g_pcc_val = val;
++	}
++#endif
++
+ 	/**
+ 	 * sde_crtc is virtual ensure that hardware has been attached to the
+ 	 * crtc. Check LM and dspp counts based on whether feature is a
+@@ -1118,6 +1137,16 @@ int sde_cp_crtc_set_property(struct drm_crtc *crtc,
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_DRM_MSM_KCAL_CTRL
++void kcal_force_update(void) {
++	if (g_pcc_crtc) {
++		pr_info("%s force kad kcal\n",__func__);
++		sde_cp_crtc_set_property(g_pcc_crtc, g_pcc_property, g_pcc_val);
++	}
++}
++EXPORT_SYMBOL(kcal_force_update);
++#endif
++
+ int sde_cp_crtc_get_property(struct drm_crtc *crtc,
+ 			     struct drm_property *property, uint64_t *val)
+ {
+diff --git a/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c
+index 9382f04a667c..a722000dc6b6 100644
+--- a/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c
++++ b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.c
+@@ -91,6 +91,8 @@ static ssize_t store_##node(struct device *dev,			\
+ 									\
+ 	kcal_lut_data.object = val;					\
+ 									\
++	kcal_force_update();                                            \
++									\
+ 	return count;							\
+ }									\
+ 									\
+@@ -125,6 +127,8 @@ static ssize_t store_kcal(struct device *dev,
+ 	pcc->green = max(kcal_g, kcal_lut_data.min_value);
+ 	pcc->blue  = max(kcal_b, kcal_lut_data.min_value);
+ 
++	kcal_force_update();
++
+ 	return count;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h
+index 4bc8d6ded6c4..dd8c716efb1e 100644
+--- a/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h
++++ b/drivers/gpu/drm/msm/sde/sde_hw_kcal_ctrl.h
+@@ -63,6 +63,12 @@ struct drm_msm_pa_hsic sde_hw_kcal_hsic_struct(void);
+  * @plane: index of pcc color plane.
+  */
+ void sde_hw_kcal_pcc_adjust(u32 *data, int plane);
++
++/**
++ * kcal_force_update() - force reprocessing on config change.
++ */
++void kcal_force_update(void);
++
+ #else
+ static inline struct sde_hw_kcal sde_hw_kcal_get(void)
+ {
+-- 
+2.25.1
+
+
+From 50be100b00815cfc765e3c5076f59c098b61371f Mon Sep 17 00:00:00 2001
+From: Panchajanya1999 <panchajanya@azure-dev.live>
+Date: Sat, 9 May 2020 19:38:34 +0530
+Subject: [PATCH 3/3] violet-perf_defconfig: Enable KCAL color control
+
+Change-Id: Ic0d8bb79d26e353aafd0e4ab77bfd21299b1c785
+Signed-off-by: Panchajanya1999 <panchajanya@azure-dev.live>
+(cherry picked from commit bd107983619ec1d44318369011949cad460330a0)
+---
+ arch/arm64/configs/vendor/violet-perf_defconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/configs/vendor/violet-perf_defconfig b/arch/arm64/configs/vendor/violet-perf_defconfig
+index 9f41791046be..1b47cd8e0c7f 100644
+--- a/arch/arm64/configs/vendor/violet-perf_defconfig
++++ b/arch/arm64/configs/vendor/violet-perf_defconfig
+@@ -3307,6 +3307,7 @@ CONFIG_DRM_MSM_DSI_STAGING=y
+ CONFIG_DRM_SDE_WB=y
+ # CONFIG_DRM_SDE_SHD is not set
+ # CONFIG_DRM_SDE_SHP is not set
++CONFIG_DRM_MSM_KCAL_CTRL=y
+ CONFIG_DRM_SDE_EVTLOG_DEBUG=y
+ CONFIG_DRM_SDE_RSC=y
+ # CONFIG_FENCE_DEBUG is not set
+-- 
+2.25.1
+

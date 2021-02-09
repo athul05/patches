@@ -1,0 +1,34 @@
+From 38ca8b87b27ec42b25c1d8d9d7873ca0244e009a Mon Sep 17 00:00:00 2001
+From: Alexander <YaAlex@yaalex.tk>
+Date: Sat, 12 Sep 2020 05:57:11 +0000
+Subject: [PATCH] leds: vibrator_ldo: export vmax_mv as vtg_level
+
+Signed-off-by: Alexander <YaAlex@yaalex.tk>
+---
+ drivers/leds/leds-qpnp-vibrator-ldo.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/leds/leds-qpnp-vibrator-ldo.c b/drivers/leds/leds-qpnp-vibrator-ldo.c
+index dd19dd1af64d..077d5c1d95f7 100644
+--- a/drivers/leds/leds-qpnp-vibrator-ldo.c
++++ b/drivers/leds/leds-qpnp-vibrator-ldo.c
+@@ -373,7 +373,7 @@ static ssize_t qpnp_vib_store_vmax(struct device *dev,
+ 	mutex_lock(&chip->lock);
+ 	chip->vmax_uV = data;
+ 	mutex_unlock(&chip->lock);
+-	return ret;
++	return count;
+ }
+ 
+ static struct device_attribute qpnp_vib_attrs[] = {
+@@ -381,6 +381,7 @@ static struct device_attribute qpnp_vib_attrs[] = {
+ 	__ATTR(duration, 0664, qpnp_vib_show_duration, qpnp_vib_store_duration),
+ 	__ATTR(activate, 0664, qpnp_vib_show_activate, qpnp_vib_store_activate),
+ 	__ATTR(vmax_mv, 0664, qpnp_vib_show_vmax, qpnp_vib_store_vmax),
++        __ATTR(vtg_level, 0664, qpnp_vib_show_vmax, qpnp_vib_store_vmax),
+ };
+ 
+ static int qpnp_vib_parse_dt(struct device *dev, struct vib_ldo_chip *chip)
+-- 
+2.25.1
+
